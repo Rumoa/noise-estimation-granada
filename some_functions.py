@@ -71,6 +71,11 @@ pauli_projective_povm = (
 ).reshape(-1, 2, 2, 2)
 
 
+pauli_projective_povm_super = jnp.array(
+    [a.flatten() for a in pauli_projective_povm.reshape(6, 2, 2)]
+).reshape(-1, 2, 4)
+
+
 def _make_pauli_dissipator(A, B):
     return _sprepost(A, B) - 0.5 * (_spre(B @ A) + _spost(B @ A))
 
@@ -101,38 +106,6 @@ generators_hermitian_3d_matrices = np.array(
         1j * np.array([[0, 0, 0], [0, 0, -1], [0, 1, 0]]),
     ]
 )
-
-
-class OneQubitParameters(eqx.Module):
-    d: int
-    N: int
-    parameters: jnp.array
-
-    def __init__(self, dimension_system, pars):
-        self.d = dimension_system
-        self.N = self.d**2
-        self.parameters = self.set_pars(pars)
-
-    @property
-    def n_indep_hamiltonian(self):
-        return self.d**2 - 1
-
-    @property
-    def n_indep_dissipator(self):
-        return (self.N - 1) ** 2
-
-    def set_pars(self, pars):
-        parameters = jnp.zeros([self.n_indep_dissipator + self.n_indep_hamiltonian])
-        parameters = parameters.at[:].set(pars)
-        return parameters
-
-    @property
-    def hamiltonian_pars(self):
-        return self.parameters[0 : self.n_indep_hamiltonian]
-
-    @property
-    def dissipator_pars(self):
-        return self.parameters[self.n_indep_hamiltonian :]
 
 
 @jax.jit
@@ -175,3 +148,62 @@ def evolve_state(lindbladian, time, rho_super):
 
 def compute_probability(rho_super, povm_super):
     return clean_probabilities(jnp.dot(_dag(rho_super), povm_super)).real
+
+
+def generate_complete_lindbladian(parameters_hamiltonian, parameters_dissipator):
+    hamiltonian = generate_hamiltonian_one_qubit(
+        parameters_hamiltonian, generators_traceless_hermitian
+    )
+    lindblad_matrix = generate_hermitian_matrix(
+        parameters_dissipator, generators_hermitian_3d_matrices
+    )
+
+    hamiltonian_superop = _make_superop_hamiltonian(hamiltonian)
+    dissipator_superop = _make_dissipator(lindblad_matrix, _Pauli_dissipators_array)
+    lindbladian = hamiltonian_superop + dissipator_superop
+    return lindbladian
+
+
+_set_of_initial_states_super = jnp.array(
+    [
+        qu.ket2dm(ket).full().flatten()
+        for ket in [
+            qu.basis(2, 0),
+            qu.basis(2, 1),
+            (qu.basis(2, 0) + qu.basis(2, 1)).unit(),
+            (qu.basis(2, 0) + 1j * qu.basis(2, 1)).unit(),
+        ]
+    ]
+)
+
+
+def likelihood_experiment(experiment, parameters):
+    initial_state_index = experiment.initial_state.squeeze()
+    measurement_basis_index = experiment.measurement_basis.squeeze()
+    time = experiment.time.squeeze()
+
+    initial_state_super = _set_of_initial_states_super[initial_state_index]
+    povm_super = pauli_projective_povm_super[measurement_basis_index]
+
+    lindbladian = generate_complete_lindbladian(
+        parameters.hamiltonian_pars, parameters.dissipator_pars
+    )
+
+    evolved_initial_state_super = evolve_state(lindbladian, time, initial_state_super)
+
+    probabilities_outcomes_basis = compute_probability(
+        evolved_initial_state_super, povm_super
+    )
+    return probabilities_outcomes_basis
+
+
+def likelihood_data(data, parameters):
+    experiment = data.experiment
+    outcome = data.outcome.squeeze()
+    probability_outcome = likelihood_experiment(experiment, parameters)[outcome]
+    return probability_outcome
+
+
+def neg_log_likelihood_data(data, parameters):
+    minus_log_lkl = -1 * jnp.log(likelihood_data(data, parameters))
+    return minus_log_lkl
